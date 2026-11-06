@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/// @notice Educational EIP-7702 delegated EOA recurring-payment implementation.
-/// @dev Deploy the implementation on Base Mainnet, chain ID 8453.
-///      When delegated code executes, address(this) is the delegated EOA.
-///      The EOA's own ETH balance is used for the payment.
-
+/// @notice EIP-7702 delegated EOA recurring-payment wallet.
+/// @dev Base Mainnet only. The delegated EOA holds and spends the ETH.
 interface AggregatorV3Interface {
     function decimals() external view returns (uint8);
 
@@ -24,27 +21,22 @@ interface AggregatorV3Interface {
 
 contract RecurringBaseEthWallet {
     uint256 public constant BASE_CHAIN_ID = 8453;
-
-    // $4,000.00 represented in cents.
     uint256 public constant PAYMENT_USD_CENTS = 400_000;
 
     uint64 public constant PAYMENT_INTERVAL = 7 days;
     uint256 public constant MAX_PRICE_AGE = 1 hours;
     uint256 public constant SEQUENCER_GRACE_PERIOD = 1 hours;
 
-    // Exact recipient supplied by the wallet owner.
     address payable public constant RECIPIENT =
         payable(0x110741e1a3467c90a9f94fa4831ccd5acc95b438);
 
-    // Chainlink Base Mainnet ETH/USD feed (8 decimals).
     address public constant ETH_USD_FEED =
         0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70;
 
-    // Chainlink Base Mainnet sequencer uptime feed.
     address public constant SEQUENCER_UPTIME_FEED =
         0xBCF85224fc0756B9Fa45aA7892530B47e10b6433;
 
-    // Namespaced storage for the delegated EOA.
+    // Keep this storage slot and struct layout stable.
     bytes32 private constant STATE_SLOT =
         keccak256("recurring.base.eth.wallet.storage.v1");
 
@@ -83,6 +75,13 @@ contract RecurringBaseEthWallet {
     event ScheduleResumed(address indexed wallet);
     event KeeperChanged(address indexed wallet, address indexed newKeeper);
 
+    event PaymentPolicyUpdated(
+        uint64 endTime,
+        uint32 maxPayments,
+        uint256 maxEthPerPayment,
+        uint256 reserveWei
+    );
+
     error WrongNetwork();
     error OnlyWalletOwner();
     error OnlyKeeper();
@@ -97,6 +96,8 @@ contract RecurringBaseEthWallet {
     error SequencerGracePeriod();
     error InvalidPrice();
     error StalePrice();
+    error InvalidOracleRound();
+    error ZeroPayment();
     error PaymentExceedsCap();
     error InsufficientWalletBalance(
         uint256 required,
@@ -113,7 +114,7 @@ contract RecurringBaseEthWallet {
     }
 
     modifier onlyWalletOwner() {
-        // The owner calls the delegated EOA itself.
+        // Owner must submit a transaction to the delegated EOA itself.
         if (msg.sender != address(this)) {
             revert OnlyWalletOwner();
         }
@@ -132,11 +133,9 @@ contract RecurringBaseEthWallet {
         }
     }
 
-    /// @notice Accept native Base ETH.
     receive() external payable {}
 
-    /// @notice Configure the recurring payment schedule.
-    /// @dev Call this by sending a transaction from the EOA to itself.
+    /// @notice Configure the initial weekly payment schedule.
     function configureSchedule(
         uint64 endTime,
         uint32 maxPayments,
@@ -146,24 +145,35 @@ contract RecurringBaseEthWallet {
     ) external onlyBase onlyWalletOwner {
         WalletState storage s = _state();
 
-        if (s.initialized) {
-            revert AlreadyInitialized();
-        }
+        if (s.initialized) revert AlreadyInitialized();
 
         if (
             endTime <= block.timestamp ||
             maxPayments == 0 ||
             keeper == address(0) ||
-            maxEthPerPayment == 0
+            maxEthPerPayment == 0 ||
+            reserveWei > type(uint256).max - maxEthPerPayment
+        ) {
+            revert InvalidConfiguration();
+        }
+
+        uint256 firstPayment =
+            block.timestamp + PAYMENT_INTERVAL;
+
+        uint256 lastPayment =
+            firstPayment +
+            (uint256(maxPayments) - 1) * PAYMENT_INTERVAL;
+
+        if (
+            firstPayment > type(uint64).max ||
+            lastPayment > endTime
         ) {
             revert InvalidConfiguration();
         }
 
         s.initialized = true;
         s.enabled = true;
-        s.nextPaymentAt = uint64(
-            block.timestamp + PAYMENT_INTERVAL
-        );
+        s.nextPaymentAt = uint64(firstPayment);
         s.endTime = endTime;
         s.maxPayments = maxPayments;
         s.keeper = keeper;
@@ -181,8 +191,7 @@ contract RecurringBaseEthWallet {
         );
     }
 
-    /// @notice Execute a payment when the seven-day interval has elapsed.
-    /// @dev The keeper calls the delegated EOA. ETH comes from that EOA.
+    /// @notice Execute one authorized weekly payment.
     function executePayment() external onlyBase {
         WalletState storage s = _state();
 
@@ -207,12 +216,18 @@ contract RecurringBaseEthWallet {
 
         uint256 price = _readEthUsdPrice();
 
-        // ETH amount in wei for $4,000, using an 8-decimal USD price.
+        // USD cents * 10^26 / USD price with 8 decimals.
         uint256 amountWei =
             (PAYMENT_USD_CENTS * 1e24) / price;
 
+        if (amountWei == 0) revert ZeroPayment();
+
         if (amountWei > s.maxEthPerPayment) {
             revert PaymentExceedsCap();
+        }
+
+        if (s.reserveWei > type(uint256).max - amountWei) {
+            revert InvalidConfiguration();
         }
 
         uint256 requiredBalance = amountWei + s.reserveWei;
@@ -225,17 +240,22 @@ contract RecurringBaseEthWallet {
             );
         }
 
-        // State changes revert automatically if the ETH transfer fails.
-        s.paymentsMade += 1;
-        s.nextPaymentAt = uint64(
-            block.timestamp + PAYMENT_INTERVAL
-        );
+        uint256 nextDue =
+            block.timestamp + PAYMENT_INTERVAL;
 
-        (bool success, ) = RECIPIENT.call{value: amountWei}("");
-
-        if (!success) {
-            revert TransferFailed();
+        if (nextDue > type(uint64).max) {
+            revert InvalidConfiguration();
         }
+
+        // Effects before interaction.
+        // A failed transfer reverts these changes automatically.
+        s.paymentsMade += 1;
+        s.nextPaymentAt = uint64(nextDue);
+
+        (bool success, ) =
+            RECIPIENT.call{value: amountWei}("");
+
+        if (!success) revert TransferFailed();
 
         s.executing = false;
 
@@ -248,7 +268,7 @@ contract RecurringBaseEthWallet {
         );
     }
 
-    /// @notice Stop recurring payments.
+    /// @notice Pause recurring payments.
     function pause() external onlyBase onlyWalletOwner {
         WalletState storage s = _state();
 
@@ -287,7 +307,55 @@ contract RecurringBaseEthWallet {
         emit KeeperChanged(address(this), newKeeper);
     }
 
-    /// @notice Read the current payment schedule.
+    /// @notice Owner-authorized update of future payment limits.
+    /// @dev Cannot change the fixed recipient or payment USD target.
+    function updatePaymentPolicy(
+        uint64 newEndTime,
+        uint32 newMaxPayments,
+        uint256 newMaxEthPerPayment,
+        uint256 newReserveWei
+    ) external onlyBase onlyWalletOwner {
+        WalletState storage s = _state();
+
+        if (!s.initialized) revert NotInitialized();
+
+        if (
+            newEndTime <= block.timestamp ||
+            newMaxPayments < s.paymentsMade ||
+            newMaxEthPerPayment == 0 ||
+            newReserveWei >
+                type(uint256).max - newMaxEthPerPayment
+        ) {
+            revert InvalidConfiguration();
+        }
+
+        uint256 remaining =
+            uint256(newMaxPayments) - s.paymentsMade;
+
+        if (remaining > 0) {
+            uint256 lastPayment =
+                uint256(s.nextPaymentAt) +
+                (remaining - 1) * PAYMENT_INTERVAL;
+
+            if (lastPayment > newEndTime) {
+                revert InvalidConfiguration();
+            }
+        }
+
+        s.endTime = newEndTime;
+        s.maxPayments = newMaxPayments;
+        s.maxEthPerPayment = newMaxEthPerPayment;
+        s.reserveWei = newReserveWei;
+
+        emit PaymentPolicyUpdated(
+            newEndTime,
+            newMaxPayments,
+            newMaxEthPerPayment,
+            newReserveWei
+        );
+    }
+
+    /// @notice Read current schedule and limits.
     function getSchedule()
         external
         view
@@ -318,7 +386,7 @@ contract RecurringBaseEthWallet {
         );
     }
 
-    /// @notice Calculate the current ETH amount for the $4,000 target.
+    /// @notice Calculate the current ETH equivalent of $4,000.
     function quotePaymentWei()
         external
         view
@@ -326,22 +394,33 @@ contract RecurringBaseEthWallet {
     {
         price = _readEthUsdPrice();
 
-        amountWei = (PAYMENT_USD_CENTS * 1e24) / price;
+        amountWei =
+            (PAYMENT_USD_CENTS * 1e24) / price;
+
+        if (amountWei == 0) revert ZeroPayment();
     }
 
-    /// @notice Read and validate the ETH/USD price.
+    /// @notice Read and validate Chainlink feeds.
     function _readEthUsdPrice()
         private
         view
         returns (uint256)
     {
         (
-            ,
+            uint80 seqRound,
             int256 sequencerAnswer,
             uint256 startedAt,
             ,
+            uint80 seqAnsweredInRound
         ) = AggregatorV3Interface(SEQUENCER_UPTIME_FEED)
             .latestRoundData();
+
+        if (
+            seqRound == 0 ||
+            seqAnsweredInRound < seqRound
+        ) {
+            revert InvalidOracleRound();
+        }
 
         if (sequencerAnswer != 0) {
             revert SequencerUnavailable();
@@ -355,14 +434,25 @@ contract RecurringBaseEthWallet {
             revert SequencerGracePeriod();
         }
 
+        if (AggregatorV3Interface(ETH_USD_FEED).decimals() != 8) {
+            revert InvalidPrice();
+        }
+
         (
-            ,
+            uint80 roundId,
             int256 answer,
             ,
             uint256 updatedAt,
-
+            uint80 answeredInRound
         ) = AggregatorV3Interface(ETH_USD_FEED)
             .latestRoundData();
+
+        if (
+            roundId == 0 ||
+            answeredInRound < roundId
+        ) {
+            revert InvalidOracleRound();
+        }
 
         if (answer <= 0) revert InvalidPrice();
 
@@ -372,12 +462,6 @@ contract RecurringBaseEthWallet {
             block.timestamp - updatedAt > MAX_PRICE_AGE
         ) {
             revert StalePrice();
-        }
-
-        if (
-            AggregatorV3Interface(ETH_USD_FEED).decimals() != 8
-        ) {
-            revert InvalidPrice();
         }
 
         return uint256(answer);
