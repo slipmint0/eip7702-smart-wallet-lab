@@ -27,8 +27,6 @@ contract RecurringBaseEthWallet {
     uint256 public constant MAX_PRICE_AGE = 1 hours;
     uint256 public constant SEQUENCER_GRACE_PERIOD = 1 hours;
 
-    address payable public constant RECIPIENT =
-        payable(0x110741e1a3467c90a9f94fa4831ccd5acc95b438);
 
     address public constant ETH_USD_FEED =
         0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70;
