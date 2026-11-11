@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
@@ -27,7 +26,6 @@ contract RecurringBaseEthWallet {
     uint256 public constant MAX_PRICE_AGE = 1 hours;
     uint256 public constant SEQUENCER_GRACE_PERIOD = 1 hours;
 
-
     address public constant ETH_USD_FEED =
         0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70;
 
@@ -49,6 +47,7 @@ contract RecurringBaseEthWallet {
         address keeper;
         uint256 maxEthPerPayment;
         uint256 reserveWei;
+        address payable recipient;
     }
 
     event ScheduleConfigured(
@@ -72,6 +71,11 @@ contract RecurringBaseEthWallet {
     event SchedulePaused(address indexed wallet);
     event ScheduleResumed(address indexed wallet);
     event KeeperChanged(address indexed wallet, address indexed newKeeper);
+
+    event RecipientChanged(
+        address indexed wallet,
+        address indexed newRecipient
+    );
 
     event PaymentPolicyUpdated(
         uint64 endTime,
@@ -245,13 +249,17 @@ contract RecurringBaseEthWallet {
             revert InvalidConfiguration();
         }
 
+        if (s.recipient == address(0)) {
+            revert InvalidConfiguration();
+        }
+
         // Effects before interaction.
         // A failed transfer reverts these changes automatically.
         s.paymentsMade += 1;
         s.nextPaymentAt = uint64(nextDue);
 
         (bool success, ) =
-            RECIPIENT.call{value: amountWei}("");
+            s.recipient.call{value: amountWei}("");
 
         if (!success) revert TransferFailed();
 
@@ -259,7 +267,7 @@ contract RecurringBaseEthWallet {
 
         emit PaymentExecuted(
             address(this),
-            RECIPIENT,
+            s.recipient,
             amountWei,
             s.paymentsMade,
             price
@@ -305,8 +313,26 @@ contract RecurringBaseEthWallet {
         emit KeeperChanged(address(this), newKeeper);
     }
 
+    /// @notice Set or change the address that receives payments.
+    function setRecipient(
+        address payable newRecipient
+    ) external onlyBase onlyWalletOwner {
+        if (newRecipient == address(0)) {
+            revert InvalidConfiguration();
+        }
+
+        _state().recipient = newRecipient;
+
+        emit RecipientChanged(address(this), newRecipient);
+    }
+
+    /// @notice Read the current payment recipient.
+    function getRecipient() external view returns (address) {
+        return _state().recipient;
+    }
+
     /// @notice Owner-authorized update of future payment limits.
-    /// @dev Cannot change the fixed recipient or payment USD target.
+    /// @dev Cannot change the payment USD target.
     function updatePaymentPolicy(
         uint64 newEndTime,
         uint32 newMaxPayments,
